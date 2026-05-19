@@ -1,37 +1,155 @@
 services:
-    coolify:
-        container_name: coolify
-        restart: always
-        working_dir: /var/www/html
-        extra_hosts:
-            - host.docker.internal:host-gateway
-        networks:
-            - coolify
-        depends_on:
-            - postgres
-            - redis
-            - soketi
-    postgres:
-        image: postgres:15-alpine
-        container_name: coolify-db
-        restart: always
-        networks:
-            - coolify
-    redis:
-        image: redis:7-alpine
-        container_name: coolify-redis
-        restart: always
-        networks:
-            - coolify
-    soketi:
-        container_name: coolify-realtime
-        extra_hosts:
-            - host.docker.internal:host-gateway
-        restart: always
-        networks:
-            - coolify
-networks:
-    coolify:
-        name: coolify
-        driver: bridge
-        external: false
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kanwas
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: kanwas
+    volumes:
+      - kanwas_postgres_data:/var/lib/postgresql/data
+      - ./dev/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kanwas"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - kanwas_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  backend:
+    build:
+      context: .
+      dockerfile: ./backend/Dockerfile
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Berlin
+      PORT: 3333
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      APP_KEY: ${APP_KEY}
+      APP_NAME: kanwas
+      NODE_ENV: production
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: kanwas
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_DATABASE: kanwas
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      API_SECRET: ${API_SECRET}
+      YJS_SERVER_HOST: yjs-server:1999
+      YJS_SERVER_PROTOCOL: ws
+      DRIVE_DISK: fs
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      COMPOSIO_API_KEY: ${COMPOSIO_API_KEY}
+      PARALLEL_API_KEY: ${PARALLEL_API_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      JINA_API_KEY: ${JINA_API_KEY:-}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      POSTHOG_QUERY_API_KEY: ${POSTHOG_QUERY_API_KEY:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: https://kanwas-api.zaengerlein.de/auth/google/callback
+      SANDBOX_E2B_TEMPLATE_ID: ${SANDBOX_E2B_TEMPLATE_ID:-kanwas-execenv-staging}
+    volumes:
+      - kanwas_backend_storage:/prod/backend/storage
+    expose:
+      - "3333"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3333/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  yjs-server:
+    build:
+      context: .
+      dockerfile: ./yjs-server/Dockerfile
+    restart: unless-stopped
+    environment:
+      BACKEND_URL: http://backend:3333
+      BACKEND_API_SECRET: ${API_SECRET}
+      PORT: 1999
+      HOST: 0.0.0.0
+      YJS_SERVER_LOG_LEVEL: info
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SENTRY_ENVIRONMENT: production
+      YJS_SERVER_SAVE_DEBOUNCE_MS: 1000
+      YJS_SERVER_SOCKET_PING_INTERVAL_MS: 10000
+      YJS_SERVER_SOCKET_PING_TIMEOUT_MS: 5000
+      YJS_SERVER_STORAGE_DRIVER: fs
+      YJS_SERVER_STORE_DIR: /data/yjs-server
+    volumes:
+      - kanwas_yjs_data:/data/yjs-server
+    expose:
+      - "1999"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1999/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      backend:
+        condition: service_started
+  frontend:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM node:22-alpine AS base
+        ENV PNPM_HOME="/pnpm"
+        ENV PATH="$PNPM_HOME:$PATH"
+        RUN corepack enable
+        FROM base AS build
+        ARG VITE_API_URL
+        ARG VITE_YJS_SERVER_URL
+        ARG VITE_AUTH_TOKEN_KEY=auth_token
+        ENV VITE_API_URL=$VITE_API_URL
+        ENV VITE_YJS_SERVER_URL=$VITE_YJS_SERVER_URL
+        ENV VITE_AUTH_TOKEN_KEY=$VITE_AUTH_TOKEN_KEY
+        COPY . /app
+        WORKDIR /app
+        RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install
+        WORKDIR /app/shared
+        RUN pnpm run build
+        WORKDIR /app/frontend
+        RUN pnpm exec vite build --mode production && cp public/favicon.png dist/assets/
+        FROM nginx:alpine AS runner
+        COPY --from=build /app/frontend/dist /usr/share/nginx/html
+        RUN echo 'server { listen 80; location = / { return 302 /app/; } location = /app { return 301 /app/; } location /app/ { alias /usr/share/nginx/html/; try_files $uri $uri/ /app/index.html; } }' > /etc/nginx/conf.d/default.conf
+        EXPOSE 80
+        CMD ["nginx", "-g", "daemon off;"]
+      args:
+        VITE_API_URL: https://kanwas-api.zaengerlein.de
+        VITE_YJS_SERVER_URL: kanwas-yjs.zaengerlein.de
+        VITE_AUTH_TOKEN_KEY: kanwas_auth_token
+    restart: unless-stopped
+    expose:
+      - "80"
+    depends_on:
+      backend:
+        condition: service_started
+      yjs-server:
+        condition: service_started
+volumes:
+  kanwas_postgres_data:
+  kanwas_redis_data:
+  kanwas_backend_storage:
+  kanwas_yjs_data:
